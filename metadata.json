@@ -1,0 +1,6 @@
+{
+  "name": "MotionTracker Pro - Premiere Pro CEP Extension",
+  "description": "Professional Adobe Premiere Pro 2026 CEP Extension for pinning text, graphics, and clips to moving objects with Optical Flow & Native Mask bridge.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
