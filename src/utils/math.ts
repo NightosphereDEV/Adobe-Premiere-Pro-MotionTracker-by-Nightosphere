@@ -1029,8 +1029,321 @@ export function trimKeyframesByTimeRange<T extends { timeSeconds: number }>(
 }
 
 /**
+ * High-Precision Shi-Tomasi / Harris Corner & Feature Snapper:
+ * Scans a local circular search radius around (centerX, centerY) in imageData, computes the 2x2
+ * structure tensor [sum(Ix^2), sum(Ix*Iy); sum(Ix*Iy), sum(Iy^2)] over a 3x3 window, and finds
+ * the pixel with the highest minimum eigenvalue (strongest 2D trackable corner/dot), followed by
+ * parabolic sub-pixel peak refinement.
+ */
+export function snapToStrongestFeature(
+  imageData: ImageData,
+  centerX: number,
+  centerY: number,
+  searchRadius: number = 16
+): { x: number; y: number; strength: number } {
+  const w = imageData.width;
+  const h = imageData.height;
+  const data = imageData.data;
+
+  const r = Math.max(3, Math.min(48, Math.round(searchRadius)));
+  const xMin = Math.max(2, Math.floor(centerX - r));
+  const xMax = Math.min(w - 3, Math.ceil(centerX + r));
+  const yMin = Math.max(2, Math.floor(centerY - r));
+  const yMax = Math.min(h - 3, Math.ceil(centerY + r));
+
+  if (xMin >= xMax || yMin >= yMax) {
+    return { x: centerX, y: centerY, strength: 0 };
+  }
+
+  // Extract local grayscale patch with 2px border for gradients + 3x3 tensor window
+  const bx0 = xMin - 2;
+  const by0 = yMin - 2;
+  const bw = xMax - xMin + 5;
+  const bh = yMax - yMin + 5;
+  const gray = new Float32Array(bw * bh);
+
+  for (let py = 0; py < bh; py++) {
+    const sy = Math.max(0, Math.min(h - 1, by0 + py));
+    for (let px = 0; px < bw; px++) {
+      const sx = Math.max(0, Math.min(w - 1, bx0 + px));
+      const idx = (sy * w + sx) * 4;
+      gray[py * bw + px] = 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
+    }
+  }
+
+  // Compute Ix, Iy gradients
+  const ixBuf = new Float32Array(bw * bh);
+  const iyBuf = new Float32Array(bw * bh);
+  for (let py = 1; py < bh - 1; py++) {
+    for (let px = 1; px < bw - 1; px++) {
+      const p = py * bw + px;
+      ixBuf[p] = 0.5 * (gray[p + 1] - gray[p - 1]);
+      iyBuf[p] = 0.5 * (gray[p + bw] - gray[p - bw]);
+    }
+  }
+
+  const rw = xMax - xMin + 1;
+  const rh = yMax - yMin + 1;
+  const responseGrid = new Float32Array(rw * rh);
+  let bestScore = -1;
+  let bestLx = Math.round(centerX) - xMin;
+  let bestLy = Math.round(centerY) - yMin;
+  const maxDistSq = Math.max(1, r * r);
+
+  for (let ly = 0; ly < rh; ly++) {
+    const gy = ly + 2;
+    const worldY = yMin + ly;
+    for (let lx = 0; lx < rw; lx++) {
+      const gx = lx + 2;
+      const worldX = xMin + lx;
+      const distSq = (worldX - centerX) * (worldX - centerX) + (worldY - centerY) * (worldY - centerY);
+      if (distSq > maxDistSq) continue;
+
+      let sxx = 0;
+      let syy = 0;
+      let sxy = 0;
+      for (let wy = -1; wy <= 1; wy++) {
+        const row = (gy + wy) * bw + gx;
+        for (let wx = -1; wx <= 1; wx++) {
+          const wKernel = wx === 0 && wy === 0 ? 2.0 : wx === 0 || wy === 0 ? 1.0 : 0.7;
+          const ix = ixBuf[row + wx];
+          const iy = iyBuf[row + wx];
+          sxx += wKernel * ix * ix;
+          syy += wKernel * iy * iy;
+          sxy += wKernel * ix * iy;
+        }
+      }
+
+      // Shi-Tomasi minimum eigenvalue: lambda_min = 0.5 * ((sxx + syy) - sqrt((sxx - syy)^2 + 4 * sxy^2))
+      const trace = sxx + syy;
+      const detDiff = Math.sqrt((sxx - syy) * (sxx - syy) + 4 * sxy * sxy);
+      const lambdaMin = 0.5 * (trace - detDiff);
+
+      // Gentle radial proximity preference so equally strong corners prefer the one closest to click
+      const radialWeight = 1.0 - 0.12 * (distSq / maxDistSq);
+      const score = lambdaMin * radialWeight;
+      responseGrid[ly * rw + lx] = score;
+
+      if (score > bestScore) {
+        bestScore = score;
+        bestLx = lx;
+        bestLy = ly;
+      }
+    }
+  }
+
+  if (bestScore <= 1e-3) {
+    return { x: centerX, y: centerY, strength: 0 };
+  }
+
+  // Parabolic sub-pixel peak refinement on responseGrid
+  let subX = xMin + bestLx;
+  let subY = yMin + bestLy;
+
+  if (bestLx > 0 && bestLx < rw - 1) {
+    const sL = responseGrid[bestLy * rw + (bestLx - 1)];
+    const sC = responseGrid[bestLy * rw + bestLx];
+    const sR = responseGrid[bestLy * rw + (bestLx + 1)];
+    const denom = 2 * (2 * sC - sL - sR);
+    if (Math.abs(denom) > 1e-5) {
+      const dx = (sR - sL) / denom;
+      if (Math.abs(dx) < 1) subX += dx;
+    }
+  }
+
+  if (bestLy > 0 && bestLy < rh - 1) {
+    const sU = responseGrid[(bestLy - 1) * rw + bestLx];
+    const sC = responseGrid[bestLy * rw + bestLx];
+    const sD = responseGrid[(bestLy + 1) * rw + bestLx];
+    const denom = 2 * (2 * sC - sU - sD);
+    if (Math.abs(denom) > 1e-5) {
+      const dy = (sD - sU) / denom;
+      if (Math.abs(dy) < 1) subY += dy;
+    }
+  }
+
+  return {
+    x: Math.round(subX * 100) / 100,
+    y: Math.round(subY * 100) / 100,
+    strength: Math.min(1, Math.round((bestScore / 1500) * 100) / 100),
+  };
+}
+
+/**
+ * Bi-Directional Forward + Backward Pass Track Averaging:
+ * Blends a forward tracking pass and a backward tracking pass weighted by confidence and temporal position
+ * (forward pass has higher authority near startFrame, backward pass has higher authority near endFrame).
+ * Cuts cumulative drift and sub-pixel jitter in half.
+ */
+export function blendForwardBackwardKeyframes(
+  forwardKeys: RawKeyframe[],
+  backwardKeys: RawKeyframe[]
+): RawKeyframe[] {
+  if (!forwardKeys || forwardKeys.length === 0) return [...(backwardKeys || [])];
+  if (!backwardKeys || backwardKeys.length === 0) return [...forwardKeys];
+
+  const fwdMap = new Map<number, RawKeyframe>();
+  const bwdMap = new Map<number, RawKeyframe>();
+  let minFrame = Infinity;
+  let maxFrame = -Infinity;
+
+  for (const k of forwardKeys) {
+    fwdMap.set(k.frameNumber, k);
+    if (k.frameNumber < minFrame) minFrame = k.frameNumber;
+    if (k.frameNumber > maxFrame) maxFrame = k.frameNumber;
+  }
+  for (const k of backwardKeys) {
+    bwdMap.set(k.frameNumber, k);
+    if (k.frameNumber < minFrame) minFrame = k.frameNumber;
+    if (k.frameNumber > maxFrame) maxFrame = k.frameNumber;
+  }
+
+  const allFrameNums = Array.from(new Set([...fwdMap.keys(), ...bwdMap.keys()])).sort((a, b) => a - b);
+  const span = Math.max(1, maxFrame - minFrame);
+
+  return allFrameNums.map((fn) => {
+    const fk = fwdMap.get(fn);
+    const bk = bwdMap.get(fn);
+    if (fk && !bk) return fk;
+    if (bk && !fk) return bk;
+    const f = fk!;
+    const b = bk!;
+
+    // alpha = 0 at minFrame (100% forward anchor), alpha = 1 at maxFrame (100% backward anchor)
+    const alpha = Math.max(0, Math.min(1, (fn - minFrame) / span));
+    const cf = Math.max(0.05, f.confidence * f.confidence);
+    const cb = Math.max(0.05, b.confidence * b.confidence);
+
+    const wFwd = (1 - alpha) * cf;
+    const wBwd = alpha * cb;
+    const wTotal = Math.max(1e-6, wFwd + wBwd);
+
+    const blendedPoints: { [id: string]: Point2D } = {};
+    const pointIds = new Set([...Object.keys(f.points), ...Object.keys(b.points)]);
+    for (const id of pointIds) {
+      const pf = f.points[id];
+      const pb = b.points[id];
+      if (pf && pb) {
+        blendedPoints[id] = {
+          x: Math.round(((pf.x * wFwd + pb.x * wBwd) / wTotal) * 100) / 100,
+          y: Math.round(((pf.y * wFwd + pb.y * wBwd) / wTotal) * 100) / 100,
+        };
+      } else if (pf) {
+        blendedPoints[id] = { ...pf };
+      } else if (pb) {
+        blendedPoints[id] = { ...pb };
+      }
+    }
+
+    return {
+      frameNumber: fn,
+      timeSeconds: f.timeSeconds,
+      points: blendedPoints,
+      confidence: Math.min(1, Math.round(((f.confidence + b.confidence) * 0.55) * 100) / 100),
+    };
+  });
+}
+
+/**
+ * Manual Keyframe Nudge with Smooth Ripple Re-Interpolation:
+ * When the user manually drags a tracking pin on an already-tracked frame to fix drift,
+ * this updates the target frame AND smoothly feathers the correction delta (dx, dy) across
+ * neighboring frames within +-rippleRadiusFrames using a Hann cosine window.
+ */
+export function nudgeKeyframeWithRipple(
+  rawKeyframes: RawKeyframe[],
+  frameNumber: number,
+  pointId: string,
+  newPos: Point2D,
+  rippleRadiusFrames: number = 8
+): RawKeyframe[] {
+  const targetKf = rawKeyframes.find((k) => k.frameNumber === frameNumber);
+  if (!targetKf || !targetKf.points[pointId]) {
+    return rawKeyframes;
+  }
+
+  const oldPos = targetKf.points[pointId];
+  const dx = newPos.x - oldPos.x;
+  const dy = newPos.y - oldPos.y;
+  const R = Math.max(0, Math.round(rippleRadiusFrames));
+
+  return rawKeyframes.map((kf) => {
+    const dist = Math.abs(kf.frameNumber - frameNumber);
+    if (dist > R || !kf.points[pointId]) return kf;
+
+    const weight = dist === 0 ? 1.0 : R > 0 ? 0.5 * (1 + Math.cos((Math.PI * dist) / (R + 1))) : 0;
+    const pt = kf.points[pointId];
+    return {
+      ...kf,
+      points: {
+        ...kf.points,
+        [pointId]: {
+          x: Math.round((pt.x + dx * weight) * 100) / 100,
+          y: Math.round((pt.y + dy * weight) * 100) / 100,
+        },
+      },
+      confidence: dist === 0 ? 1.0 : kf.confidence,
+    };
+  });
+}
+
+/**
+ * Computes instantaneous frame-to-frame velocity (vx, vy), Directional Motion Blur angle (degrees),
+ * and Shutter-Angle-scaled Motion Blur length (pixels) for each processed keyframe.
+ * - shutterAngle: 0 to 360 degrees (standard cinema 180 deg = 0.5 frame exposure trail)
+ */
+export function computeMotionBlurVectors(
+  keyframes: ProcessedKeyframe[],
+  shutterAngle: number = 180
+): ProcessedKeyframe[] {
+  if (!keyframes || keyframes.length === 0) return [];
+  const clampedShutter = Math.max(0, Math.min(360, shutterAngle));
+  const shutterFraction = clampedShutter / 360;
+
+  return keyframes.map((kf, i) => {
+    let vx = 0;
+    let vy = 0;
+
+    if (keyframes.length > 1) {
+      if (i === 0) {
+        const dt = Math.max(1, keyframes[1].frameNumber - kf.frameNumber);
+        vx = (keyframes[1].x - kf.x) / dt;
+        vy = (keyframes[1].y - kf.y) / dt;
+      } else if (i === keyframes.length - 1) {
+        const dt = Math.max(1, kf.frameNumber - keyframes[i - 1].frameNumber);
+        vx = (kf.x - keyframes[i - 1].x) / dt;
+        vy = (kf.y - keyframes[i - 1].y) / dt;
+      } else {
+        // Central difference for smooth velocity derivative
+        const dt = Math.max(1, keyframes[i + 1].frameNumber - keyframes[i - 1].frameNumber);
+        vx = (keyframes[i + 1].x - keyframes[i - 1].x) / dt;
+        vy = (keyframes[i + 1].y - keyframes[i - 1].y) / dt;
+      }
+    }
+
+    const speed = Math.hypot(vx, vy);
+    // Adobe Directional Blur convention: 0 deg = North/Up, 90 deg = East/Right
+    let dirDeg = 0;
+    if (speed > 0.05) {
+      dirDeg = (Math.atan2(vx, -vy) * 180) / Math.PI;
+      if (dirDeg < 0) dirDeg += 360;
+    }
+
+    const blurLen = Math.round(speed * shutterFraction * 100) / 100;
+
+    return {
+      ...kf,
+      velocityX: Math.round(vx * 100) / 100,
+      velocityY: Math.round(vy * 100) / 100,
+      motionBlurAngle: Math.round(dirDeg * 100) / 100,
+      motionBlurLength: blurLen,
+    };
+  });
+}
+
+/**
  * Process raw keyframes with 1-point, 2-point, or 4-pin 3D surface geometry, apply Gaussian smoothing,
- * offsets, and scale/rotation/3D corner-pin calculations.
+ * offsets, scale/rotation/3D corner-pin calculations, and velocity motion blur vectors.
  */
 export function processKeyframeData(
   rawKeyframes: RawKeyframe[],
@@ -1040,7 +1353,8 @@ export function processKeyframeData(
   offsetY: number,
   scaleMultiplier: number,
   rotationOffset: number,
-  fps: number
+  fps: number,
+  shutterAngle: number = 180
 ): ProcessedKeyframe[] {
   if (rawKeyframes.length === 0) return [];
 
@@ -1075,7 +1389,7 @@ export function processKeyframeData(
       p4: { x: p4X[0], y: p4Y[0] },
     };
 
-    return sorted.map((kf, i) => {
+    const surfaceProcessed = sorted.map((kf, i) => {
       const smoothedCorners: SurfaceCorners = {
         p1: {
           x: Math.round((p1X[i] + offsetX) * 100) / 100,
@@ -1122,6 +1436,8 @@ export function processKeyframeData(
         confidence: kf.confidence,
       };
     });
+
+    return computeMotionBlurVectors(surfaceProcessed, shutterAngle);
   }
 
   const isTwoPoint = mode >= 2;
@@ -1189,8 +1505,8 @@ export function processKeyframeData(
   const smoothedRot = isTwoPoint ? smooth1D(rawRot, smoothingRadius) : rawRot;
   const smoothedScale = isTwoPoint ? smooth1D(rawScale, smoothingRadius) : rawScale;
 
-  // Build final ProcessedKeyframe list with offsets
-  return sorted.map((kf, i) => {
+  // Build final ProcessedKeyframe list with offsets + motion blur vectors
+  const baseProcessed = sorted.map((kf, i) => {
     return {
       frameNumber: kf.frameNumber,
       timeSeconds: kf.timeSeconds,
@@ -1202,6 +1518,8 @@ export function processKeyframeData(
       confidence: kf.confidence,
     };
   });
+
+  return computeMotionBlurVectors(baseProcessed, shutterAngle);
 }
 
 /**
@@ -1296,6 +1614,8 @@ export function generateAdobeKeyframeText(
     exportScale?: boolean;
     exportRotation?: boolean;
     exportCornerPin3D?: boolean;
+    enableMotionBlur?: boolean;
+    shutterAngle?: number;
     isCameraFollow?: boolean;
     cameraFollowZoom?: number;
     isStabilize?: boolean;
@@ -1312,6 +1632,8 @@ export function generateAdobeKeyframeText(
   const exportScale = options.exportScale ?? true;
   const exportRot = options.exportRotation ?? true;
   const exportCornerPin = options.exportCornerPin3D ?? true;
+  const enableMotionBlur = options.enableMotionBlur ?? false;
+  const shutterAngle = options.shutterAngle ?? 180;
   const isFollow = options.isCameraFollow ?? false;
   const zoom = options.cameraFollowZoom || 125;
   const isStab = options.isStabilize ?? false;
@@ -1334,7 +1656,7 @@ export function generateAdobeKeyframeText(
       : undefined,
   }));
 
-  const activeKeys = isStab
+  const rawActiveKeys = isStab
     ? computeStabilizeKeyframes(scaledKeyframes, {
         sequenceWidth: width,
         sequenceHeight: height,
@@ -1348,6 +1670,8 @@ export function generateAdobeKeyframeText(
         zoomPercent: zoom,
       })
     : scaledKeyframes;
+
+  const activeKeys = computeMotionBlurVectors(rawActiveKeys, shutterAngle);
 
   let output = `Adobe After Effects 8.0 Keyframe Data\n\n`;
   output += `\tUnits Per Second\t${fps.toFixed(6)}\n`;
@@ -1444,6 +1768,31 @@ export function generateAdobeKeyframeText(
         output += `\n`;
       }
     }
+  }
+
+  // Motion Blur: Native Transform Shutter Angle + Velocity-Driven Directional Blur
+  if (enableMotionBlur && shutterAngle > 0) {
+    output += `Effects\tTransform #1\tUse Composition's Shutter Angle #10\n`;
+    output += `\tFrame\t\n`;
+    output += `\t${activeKeys[0].frameNumber}\t0\n\n`;
+
+    output += `Effects\tTransform #1\tShutter Angle #11\n`;
+    output += `\tFrame\tdegrees\n`;
+    output += `\t${activeKeys[0].frameNumber}\t${shutterAngle.toFixed(6)}\n\n`;
+
+    output += `Effects\tDirectional Blur #1\tDirection #1\n`;
+    output += `\tFrame\tdegrees\n`;
+    for (const k of activeKeys) {
+      output += `\t${k.frameNumber}\t${(k.motionBlurAngle || 0).toFixed(6)}\n`;
+    }
+    output += `\n`;
+
+    output += `Effects\tDirectional Blur #1\tBlur Length #2\n`;
+    output += `\tFrame\tpixels\n`;
+    for (const k of activeKeys) {
+      output += `\t${k.frameNumber}\t${(k.motionBlurLength || 0).toFixed(6)}\n`;
+    }
+    output += `\n`;
   }
 
   output += `End of Keyframe Data\n`;

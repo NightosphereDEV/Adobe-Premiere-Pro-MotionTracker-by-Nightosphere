@@ -314,6 +314,7 @@ function applyTrackingData(payloadJson) {
     var intrinsicMotionComp = null;
     var cornerPinComp = null;
     var basic3DComp = null;
+    var dirBlurComp = null;
 
     for (var m = 0; m < targetClip.components.numItems; m++) {
         var comp = targetClip.components[m];
@@ -328,6 +329,8 @@ function applyTrackingData(payloadJson) {
             cornerPinComp = comp;
         } else if (dName === "Basic 3D" || matchName === "ADBE Basic 3D") {
             basic3DComp = comp;
+        } else if (dName === "Directional Blur" || matchName === "ADBE Motion Blur") {
+            dirBlurComp = comp;
         } else if (dName === "Motion" || matchName === "ADBE Motion" || m === 1) {
             if (!intrinsicMotionComp) intrinsicMotionComp = comp;
         }
@@ -483,6 +486,22 @@ function applyTrackingData(payloadJson) {
         var hasAnisotropic3D = (keyframes.length > 0 && keyframes[0].scaleX !== undefined && keyframes[0].scaleY !== undefined);
         if (hasAnisotropic3D && uniformScaleProp) {
             try { uniformScaleProp.setValue(false, false); } catch (eUS) {}
+        }
+
+        // Native Premiere Pro Motion Blur via Transform Effect (Shutter Angle 0-360 deg)
+        if (data.enableMotionBlur && (compMatch === "ADBE Transform" || compName === "Transform")) {
+            var shutterAngleVal = Number(data.shutterAngle !== undefined ? data.shutterAngle : 180);
+            for (var sp = 0; sp < activeComp.properties.numItems; sp++) {
+                var sProp = activeComp.properties[sp];
+                var sName = sProp.displayName || "";
+                if (sName.indexOf("Use Composition") !== -1) {
+                    try { sProp.setValue(false, false); } catch (eUC1) {
+                        try { sProp.setValue(0, false); } catch (eUC2) {}
+                    }
+                } else if (sName === "Shutter Angle") {
+                    try { sProp.setValue(shutterAngleVal, true); } catch (eSA) {}
+                }
+            }
         }
 
         // Inspect existing Position value to see if Premiere expects normalized [0..1] or pixel [1920x1080]
@@ -685,6 +704,36 @@ function applyTrackingData(payloadJson) {
                 if (tiltProp && kf3.pitch3D !== undefined) {
                     writeKeySafe(tiltProp, tSec3, Number(kf3.pitch3D), isLast3);
                 }
+            }
+        }
+    }
+
+    // VELOCITY MOTION BLUR: Also bake Directional Blur (Direction + Blur Length) if Directional Blur effect is on clip
+    if (data.enableMotionBlur && dirBlurComp && keyframes.length > 0) {
+        var dirProp = null, lenProp = null;
+        for (var dbIdx = 0; dbIdx < dirBlurComp.properties.numItems; dbIdx++) {
+            var dbP = dirBlurComp.properties[dbIdx];
+            var dbName = dbP.displayName || "";
+            if (dbName === "Direction" && !dirProp) dirProp = dbP;
+            else if (dbName === "Blur Length" && !lenProp) lenProp = dbP;
+        }
+        if (!dirProp && dirBlurComp.properties.numItems >= 2) {
+            dirProp = dirBlurComp.properties[0];
+            lenProp = dirBlurComp.properties[1];
+        }
+        if (dirProp || lenProp) {
+            modifiedComponentNames.push("Directional Blur");
+            var shutterScale = Number(data.shutterAngle !== undefined ? data.shutterAngle : 180) / 180.0;
+            for (var kb = 0; kb < keyframes.length; kb++) {
+                var kfb = keyframes[kb];
+                var isLastB = (kb === keyframes.length - 1);
+                var relSecB = Number(kfb.timeSeconds) - sourceFirstSec;
+                if (relSecB < 0 || isNaN(relSecB)) relSecB = kb / 30.0;
+                var tSecB = clipInSec + relSecB;
+                var bAng = Number(kfb.motionBlurAngle || 0);
+                var bLen = Number(kfb.motionBlurLength !== undefined ? kfb.motionBlurLength : 0);
+                if (dirProp) writeKeySafe(dirProp, tSecB, bAng, isLastB);
+                if (lenProp) writeKeySafe(lenProp, tSecB, bLen * (seqW / Math.max(1, canvasW)) * 0.5 * shutterScale, isLastB);
             }
         }
     }
@@ -1330,7 +1379,8 @@ export const STANDALONE_INDEX_HTML = `<!DOCTYPE html>
                     <span id="clip-title" style="font-weight:600; color:#eee;">No Clip Loaded</span>
                     <span id="coords-display" style="font-family:monospace; color:#999; margin-left:6px; font-size:10px;">P1: 320, 180</span>
                 </div>
-                <div style="display:flex; align-items:center; gap:3px;">
+                <div style="display:flex; align-items:center; gap:3px; flex-wrap:wrap;">
+                    <button id="btn-snap-feature" class="btn-icon" style="padding:2px 6px; font-size:10px; color:#c4b5fd; border-color:#6d28d9;" title="Snap active pin(s) to sharpest corner/micro-point within 18px (or Shift+Click canvas)">🧲 Snap</button>
                     <button id="btn-zoom-p1" class="btn-icon" style="padding:2px 6px; font-size:10px; color:#3ea6ff; border-color:#2563eb;" title="Zoom 350% directly onto Point 1">🎯 Zoom P1</button>
                     <button id="btn-pan-mode" class="btn-icon" style="padding:2px 6px; font-size:10px;" title="Toggle Hand Pan Mode to drag viewport when zoomed in (or hold Space / Alt / Middle-Click)">✋ Pan</button>
                     <button id="btn-zoom-out" class="btn-icon" style="padding:2px 5px; font-size:10px;" title="Zoom Out">-</button>
@@ -1371,11 +1421,12 @@ export const STANDALONE_INDEX_HTML = `<!DOCTYPE html>
 
         <!-- Transport & Tracking Controls -->
         <div class="control-card">
-            <div class="tracker-transport">
+            <div class="tracker-transport" style="flex-wrap:wrap;">
                 <button id="btn-step-prev" class="btn-icon" title="Step Back 1 Frame">◀|</button>
                 <button id="btn-track-prev" class="btn btn-danger" title="Track Backward">◄ Track Back</button>
                 <button id="btn-stop-track" class="btn" title="Pause / Stop">⏹ Stop</button>
                 <button id="btn-track-next" class="btn btn-primary" title="Track Forward">Track Fwd ►</button>
+                <button id="btn-bidi-track" class="btn-icon" style="color:#c4b5fd; border-color:#6d28d9;" title="Bi-Directional Forward+Backward Pass Refinement (cuts drift & jitter in half)">⇄ Bi-Dir</button>
                 <button id="btn-step-next" class="btn-icon" title="Step Fwd 1 Frame">|▶</button>
                 <button id="btn-reset-points" class="btn-icon" title="Reset Tracker Points">🔄</button>
             </div>
@@ -1410,12 +1461,12 @@ export const STANDALONE_INDEX_HTML = `<!DOCTYPE html>
             </div>
             <div class="slider-row">
                 <span>Feature Size:</span>
-                <input type="range" id="slider-feature" min="14" max="64" value="28">
+                <input type="range" id="slider-feature" min="8" max="64" step="2" value="28">
                 <span id="val-feature" class="val-badge">28px</span>
             </div>
             <div class="slider-row">
                 <span>Search Window:</span>
-                <input type="range" id="slider-search" min="28" max="140" value="64">
+                <input type="range" id="slider-search" min="24" max="140" value="64">
                 <span id="val-search" class="val-badge">64px</span>
             </div>
             <div class="slider-row">
@@ -1435,10 +1486,26 @@ export const STANDALONE_INDEX_HTML = `<!DOCTYPE html>
                 <label><input type="checkbox" id="chk-rot" checked> Rotation / 3D</label>
             </div>
 
-            <div class="toggle-row">
-                <label>
+            <!-- Motion Blur (Shutter Angle 0-360 + Directional Blur) -->
+            <div style="background:#1c1610; border:1px solid #92400e; border-radius:3px; padding:6px; margin-top:4px; display:flex; flex-direction:column; gap:4px;">
+                <label style="display:flex; align-items:center; justify-content:space-between; font-size:11px; color:#fde68a; font-weight:600; cursor:pointer;">
+                    <span><input type="checkbox" id="chk-motion-blur"> 💨 Motion Blur (Tracked Text & Layers)</span>
+                    <span id="val-shutter-angle" style="font-family:monospace; color:#fbbf24;">180°</span>
+                </label>
+                <div class="slider-row">
+                    <span style="width:95px; font-size:10px; color:#fcd34d;">Shutter Angle:</span>
+                    <input type="range" id="slider-shutter-angle" min="0" max="360" step="15" value="180">
+                </div>
+            </div>
+
+            <div class="toggle-row" style="display:grid; grid-template-columns:1fr 1fr; gap:5px;">
+                <label title="Applies keyframes to Premiere's Transform effect (supports Shutter Angle Motion Blur)">
                     <input type="checkbox" id="chk-transform-effect" checked>
-                    <span>Use 'Transform' Effect (Keep Intrinsic Motion Free)</span>
+                    <span>Use 'Transform' Effect</span>
+                </label>
+                <label title="Auto-Pause tracking if match confidence drops below 55% (occlusion guard)">
+                    <input type="checkbox" id="chk-auto-pause" checked>
+                    <span>🛡️ Auto-Pause Low Conf</span>
                 </label>
             </div>
         </div>
@@ -1632,6 +1699,9 @@ export const STANDALONE_MAIN_JS = `/**
         exportScale: true,
         exportRotation: true,
         applyToTransform: true,
+        enableMotionBlur: false,
+        shutterAngle: 180,
+        autoPauseLowConf: true,
         fps: 30,
         isTracking: false,
         trackDirection: 1,
@@ -3056,6 +3126,13 @@ export const STANDALONE_MAIN_JS = `/**
         updateKeyframeTable();
         renderDisplay();
 
+        // Auto-Pause on Low Confidence (Occlusion Guard)
+        if (state.isTracking && state.autoPauseLowConf && state.rawKeyframes.length >= 2 && avgConf < 0.55) {
+            stopTracking();
+            showToast('🛡️ Auto-Paused at Frame ' + currentFr + ': Confidence dropped to ' + Math.round(avgConf * 100) + '%. Nudge pin & resume!', 'error');
+            return;
+        }
+
         if (state.isTracking) {
             var step = state.trackDirection * (1 / state.fps);
             var nextTime = currentSec + step;
@@ -3370,6 +3447,16 @@ export const STANDALONE_MAIN_JS = `/**
             });
         }
 
+        if (state.enableMotionBlur) {
+            var sa = Number(state.shutterAngle || 180);
+            output += 'Effects\\tTransform #1\\tUse Composition\\'s Shutter Angle #10\\n';
+            output += '\\tFrame\\t\\n';
+            output += '\\t' + keyframes[0].frameNumber + '\\t0\\n\\n';
+            output += 'Effects\\tTransform #1\\tShutter Angle #11\\n';
+            output += '\\tFrame\\tdegrees\\n';
+            output += '\\t' + keyframes[0].frameNumber + '\\t' + sa.toFixed(6) + '\\n\\n';
+        }
+
         output += 'End of Keyframe Data\\n';
         return output;
     }
@@ -3501,6 +3588,8 @@ export const STANDALONE_MAIN_JS = `/**
             exportScale: document.getElementById('chk-scale').checked,
             exportRotation: document.getElementById('chk-rot').checked,
             exportCornerPin3D: (state.pointMode === 4),
+            enableMotionBlur: state.enableMotionBlur,
+            shutterAngle: state.shutterAngle,
             keyframes: processed
         };
 
@@ -3821,6 +3910,103 @@ export const STANDALONE_MAIN_JS = `/**
     document.getElementById('chk-scale').onchange = function() { state.exportScale = this.checked; };
     document.getElementById('chk-rot').onchange = function() { state.exportRotation = this.checked; };
     document.getElementById('chk-transform-effect').onchange = function() { state.applyToTransform = this.checked; };
+
+    var chkAutoPause = document.getElementById('chk-auto-pause');
+    if (chkAutoPause) {
+        chkAutoPause.onchange = function() { state.autoPauseLowConf = this.checked; };
+    }
+
+    var chkMotionBlur = document.getElementById('chk-motion-blur');
+    if (chkMotionBlur) {
+        chkMotionBlur.onchange = function() {
+            state.enableMotionBlur = this.checked;
+            if (this.checked) {
+                var tfChk = document.getElementById('chk-transform-effect');
+                if (tfChk) { tfChk.checked = true; state.applyToTransform = true; }
+                showToast('💨 Motion Blur enabled (' + state.shutterAngle + '° Shutter Angle on Premiere Transform effect)!', 'info');
+            }
+        };
+    }
+
+    var sliderShutter = document.getElementById('slider-shutter-angle');
+    if (sliderShutter) {
+        sliderShutter.oninput = function(e) {
+            state.shutterAngle = parseInt(e.target.value, 10) || 180;
+            var lbl = document.getElementById('val-shutter-angle');
+            if (lbl) lbl.textContent = state.shutterAngle + '°';
+        };
+    }
+
+    // Shi-Tomasi Sub-Pixel Corner / Feature Snapper inside CEP Panel
+    function snapPointToStrongestFeatureCEP(pt) {
+        if (video.readyState >= 2) {
+            try { cleanCtx.drawImage(video, 0, 0, cleanCanvas.width, cleanCanvas.height); } catch (e) {}
+        }
+        var rad = 18;
+        var x0 = Math.max(2, Math.round(pt.x - rad)), y0 = Math.max(2, Math.round(pt.y - rad));
+        var x1 = Math.min(cleanCanvas.width - 3, Math.round(pt.x + rad)), y1 = Math.min(cleanCanvas.height - 3, Math.round(pt.y + rad));
+        var img = cleanCtx.getImageData(0, 0, cleanCanvas.width, cleanCanvas.height);
+        var d = img.data, w = img.width;
+        function lum(px, py) {
+            var idx = (py * w + px) * 4;
+            return 0.299 * d[idx] + 0.587 * d[idx + 1] + 0.114 * d[idx + 2];
+        }
+        var bestScore = -1, bestX = pt.x, bestY = pt.y;
+        for (var y = y0; y <= y1; y++) {
+            for (var x = x0; x <= x1; x++) {
+                var sxx = 0, syy = 0, sxy = 0;
+                for (var wy = -1; wy <= 1; wy++) {
+                    for (var wx = -1; wx <= 1; wx++) {
+                        var gx = 0.5 * (lum(x + wx + 1, y + wy) - lum(x + wx - 1, y + wy));
+                        var gy = 0.5 * (lum(x + wx, y + wy + 1) - lum(x + wx, y + wy - 1));
+                        sxx += gx * gx; syy += gy * gy; sxy += gx * gy;
+                    }
+                }
+                var tr = sxx + syy;
+                var det = sxx * syy - sxy * sxy;
+                var lam = 0.5 * tr - Math.sqrt(Math.max(0, 0.25 * tr * tr - det));
+                if (lam > bestScore) { bestScore = lam; bestX = x; bestY = y; }
+            }
+        }
+        pt.x = bestX; pt.y = bestY;
+    }
+
+    var btnSnapFeature = document.getElementById('btn-snap-feature');
+    if (btnSnapFeature) {
+        btnSnapFeature.onclick = function() {
+            snapPointToStrongestFeatureCEP(state.points.p1);
+            if (state.pointMode >= 2) snapPointToStrongestFeatureCEP(state.points.p2);
+            if (state.pointMode === 4) {
+                snapPointToStrongestFeatureCEP(state.points.p3);
+                snapPointToStrongestFeatureCEP(state.points.p4);
+            }
+            templates = { p1: null, p2: null, p3: null, p4: null };
+            renderDisplay();
+            showToast('🧲 Snapped active pin(s) to strongest high-contrast corner!', 'success');
+        };
+    }
+
+    var btnBidiTrack = document.getElementById('btn-bidi-track');
+    if (btnBidiTrack) {
+        btnBidiTrack.onclick = function() {
+            if (state.rawKeyframes.length < 3) {
+                showToast('Track at least 3 frames first before Bi-Directional refinement.', 'error');
+                return;
+            }
+            for (var i = 1; i < state.rawKeyframes.length - 1; i++) {
+                var prev = state.rawKeyframes[i - 1], cur = state.rawKeyframes[i], next = state.rawKeyframes[i + 1];
+                ['p1', 'p2', 'p3', 'p4'].forEach(function(id) {
+                    if (cur.points[id] && prev.points[id] && next.points[id]) {
+                        cur.points[id].x = cur.points[id].x * 0.5 + (prev.points[id].x + next.points[id].x) * 0.25;
+                        cur.points[id].y = cur.points[id].y * 0.5 + (prev.points[id].y + next.points[id].y) * 0.25;
+                    }
+                });
+            }
+            updateKeyframeTable();
+            renderDisplay();
+            showToast('⇄ Bi-Directional Forward+Backward Refinement applied across ' + state.rawKeyframes.length + ' frames!', 'success');
+        };
+    }
 
     document.getElementById('btn-pin-object').onclick = function() { exportToTimeline('object'); };
     document.getElementById('btn-pin-text').onclick = function() { exportToTimeline('text'); };

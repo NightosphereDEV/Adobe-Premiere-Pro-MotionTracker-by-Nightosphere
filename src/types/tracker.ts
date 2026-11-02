@@ -49,6 +49,10 @@ export interface ProcessedKeyframe {
   pitch3D?: number; // 3D Vertical Tilt / Pitch degrees (-90 to +90)
   skew?: number;    // Planar shear / perspective skew degrees
   corners?: SurfaceCorners; // 4-Pin Surface planar corners
+  velocityX?: number;      // Instantaneous X velocity (px/frame)
+  velocityY?: number;      // Instantaneous Y velocity (px/frame)
+  motionBlurAngle?: number; // Directional blur angle in degrees (-180 to 180)
+  motionBlurLength?: number; // Shutter-scaled directional blur length (px)
   confidence: number;
 }
 
@@ -72,6 +76,8 @@ export interface ExportSettings {
   exportScale: boolean;
   exportRotation: boolean;
   exportCornerPin3D?: boolean;     // true = Apply 4-Pin Corner Pin & 3D Swivel/Tilt when 4-pin surface tracked
+  enableMotionBlur?: boolean;      // true = Enable native Transform Shutter Angle & velocity directional motion blur
+  shutterAngle?: number;           // 0 to 360 degrees (180° standard cinema shutter, 360° max blur)
   offsetX: number;
   offsetY: number;
   scaleMultiplier: number;

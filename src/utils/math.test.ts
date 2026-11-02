@@ -13,6 +13,10 @@ import {
   isSupportedVideoFile,
   needsServerRemuxOrTranscode,
   matchTemplateNCC,
+  snapToStrongestFeature,
+  blendForwardBackwardKeyframes,
+  nudgeKeyframeWithRipple,
+  computeMotionBlurVectors,
 } from './math.ts';
 import { remuxTSToMP4, isMPEGTransportStream } from './tsRemuxer.ts';
 import { createWindowsInstallerBat, createZipCopyInstallerBat } from '../services/cepExportFiles.ts';
@@ -359,6 +363,104 @@ describe('Math and Tracker Utilities', () => {
     assert.equal(stabKeys[1].scale, 115);
   });
 
+  test('snapToStrongestFeature locates a high-contrast micro-corner within the search radius', () => {
+    const w = 64;
+    const h = 64;
+    const buf = new Uint8ClampedArray(w * h * 4);
+    // Create a sharp bright corner at (x >= 35, y >= 28)
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const val = x >= 35 && y >= 28 ? 240 : 20;
+        const idx = (y * w + x) * 4;
+        buf[idx] = val;
+        buf[idx + 1] = val;
+        buf[idx + 2] = val;
+        buf[idx + 3] = 255;
+      }
+    }
+    const imgData = { data: buf, width: w, height: h } as unknown as ImageData;
+    // Click roughly near (29, 22) and snap within 14px radius
+    const snapped = snapToStrongestFeature(imgData, 29, 22, 14);
+    assert.ok(Math.abs(snapped.x - 35) <= 1.5, `Expected snapped X near 35, got ${snapped.x}`);
+    assert.ok(Math.abs(snapped.y - 28) <= 1.5, `Expected snapped Y near 28, got ${snapped.y}`);
+    assert.ok(snapped.strength > 0.1, `Expected positive corner strength, got ${snapped.strength}`);
+  });
+
+  test('blendForwardBackwardKeyframes blends forward and backward passes with temporal ramp and confidence weighting', () => {
+    const forward: RawKeyframe[] = [
+      { frameNumber: 0, timeSeconds: 0, points: { p1: { x: 100, y: 100 } }, confidence: 0.99 },
+      { frameNumber: 1, timeSeconds: 0.033, points: { p1: { x: 110, y: 100 } }, confidence: 0.80 },
+      { frameNumber: 2, timeSeconds: 0.066, points: { p1: { x: 124, y: 100 } }, confidence: 0.60 }, // drifted +4px at end
+    ];
+    const backward: RawKeyframe[] = [
+      { frameNumber: 0, timeSeconds: 0, points: { p1: { x: 96, y: 100 } }, confidence: 0.60 }, // drifted -4px at start
+      { frameNumber: 1, timeSeconds: 0.033, points: { p1: { x: 110, y: 100 } }, confidence: 0.80 },
+      { frameNumber: 2, timeSeconds: 0.066, points: { p1: { x: 120, y: 100 } }, confidence: 0.99 },
+    ];
+
+    const blended = blendForwardBackwardKeyframes(forward, backward);
+    assert.equal(blended.length, 3);
+    // At frame 0 (t=0), forward pass dominates
+    assert.ok(Math.abs(blended[0].points.p1.x - 100) < 0.01);
+    // At frame 1 (midpoint), both agree at 110
+    assert.ok(Math.abs(blended[1].points.p1.x - 110) < 0.01);
+    // At frame 2 (t=1), backward pass dominates
+    assert.ok(Math.abs(blended[2].points.p1.x - 120) < 0.01);
+  });
+
+  test('nudgeKeyframeWithRipple applies exact correction at target frame and smoothly feathers across neighbors', () => {
+    const raw: RawKeyframe[] = [];
+    for (let f = 0; f <= 10; f++) {
+      raw.push({
+        frameNumber: f,
+        timeSeconds: f / 30,
+        points: { p1: { x: 200, y: 150 } },
+        confidence: 0.9,
+      });
+    }
+
+    // Nudge frame 5 by (+20, -10) with ripple radius 4 frames
+    const nudged = nudgeKeyframeWithRipple(raw, 5, 'p1', { x: 220, y: 140 }, 4);
+    // Exact target frame 5 has full delta (+20, -10) and confidence 1.0
+    assert.equal(nudged[5].points.p1.x, 220);
+    assert.equal(nudged[5].points.p1.y, 140);
+    assert.equal(nudged[5].confidence, 1.0);
+    // Neighbor frame 4 has partial feathered correction (between 200 and 220)
+    assert.ok(nudged[4].points.p1.x > 205 && nudged[4].points.p1.x < 220);
+    // Frame 0 (outside radius 4 from frame 5) is untouched
+    assert.equal(nudged[0].points.p1.x, 200);
+    assert.equal(nudged[0].points.p1.y, 150);
+  });
+
+  test('computeMotionBlurVectors and generateAdobeKeyframeText export Premiere Transform Shutter Angle & Directional Blur', () => {
+    const raw: RawKeyframe[] = [
+      { frameNumber: 0, timeSeconds: 0, points: { p1: { x: 100, y: 180 } }, confidence: 1 },
+      { frameNumber: 1, timeSeconds: 0.033, points: { p1: { x: 130, y: 180 } }, confidence: 1 }, // moving +30px right per frame
+      { frameNumber: 2, timeSeconds: 0.066, points: { p1: { x: 160, y: 180 } }, confidence: 1 },
+    ];
+
+    const processed = processKeyframeData(raw, 1, 0, 0, 0, 100, 0, 30, 180);
+    assert.equal(processed.length, 3);
+    // Moving purely horizontally right (+X, 0 Y) -> Adobe Direction angle = 90 deg (East), velocityX = 30
+    assert.equal(processed[1].velocityX, 30);
+    assert.equal(processed[1].velocityY, 0);
+    assert.equal(processed[1].motionBlurAngle, 90);
+    assert.ok((processed[1].motionBlurLength || 0) > 5, `Expected positive motion blur length, got ${processed[1].motionBlurLength}`);
+
+    const textWithBlur = generateAdobeKeyframeText(processed, {
+      fps: 30,
+      width: 1920,
+      height: 1080,
+      enableMotionBlur: true,
+      shutterAngle: 225,
+    });
+    assert.ok(textWithBlur.includes("Effects\tTransform #1\tUse Composition's Shutter Angle #10"), 'Expected Use Composition Shutter Angle override');
+    assert.ok(textWithBlur.includes('Effects\tTransform #1\tShutter Angle #11'), 'Expected Transform Shutter Angle header');
+    assert.ok(textWithBlur.includes('225.000000'), 'Expected 225 deg Shutter Angle value');
+    assert.ok(textWithBlur.includes('Effects\tDirectional Blur #1\tDirection #1'), 'Expected Directional Blur Direction keyframes');
+    assert.ok(textWithBlur.includes('Effects\tDirectional Blur #1\tBlur Length #2'), 'Expected Directional Blur Length keyframes');
+  });
+
   test('remuxTSToMP4 demuxes an H.264 MPEG-2 Transport Stream (.ts) into a valid ISO-BMFF MP4 container', () => {
     assert.equal(isMPEGTransportStream('camera_capture.ts'), true);
     assert.equal(isMPEGTransportStream('avchd_clip.mts'), true);
@@ -458,10 +560,15 @@ describe('Math and Tracker Utilities', () => {
     assert.equal(standaloneBat.includes('<span class="logo-badge">MT</span>'), false, 'Expected MT text badge to be replaced by Nightosphere logo');
     assert.ok(standaloneBat.includes('aria-label="Nightosphere Logo"'), 'Expected Nightosphere logo in Premiere Pro CEP HTML');
 
-    // Premiere Pro CEP Panel must include Pan Mode button (#btn-pan-mode) and Pan Mode controller logic (state.isPanMode)
+    // Premiere Pro CEP Panel must include Pan Mode, Corner Snap, Bi-Dir Refine, Motion Blur Shutter Angle, and 8px Micro-Point Feature Size
     assert.ok(standaloneBat.includes('id="btn-pan-mode"'), 'Expected #btn-pan-mode button in Premiere Pro CEP HTML');
-    assert.ok(standaloneBat.includes('✋ Pan'), 'Expected ✋ Pan button label in Premiere Pro CEP HTML');
-    assert.ok(standaloneBat.includes('state.isPanMode'), 'Expected state.isPanMode handler in Premiere Pro CEP JS');
+    assert.ok(standaloneBat.includes('id="btn-snap-feature"'), 'Expected #btn-snap-feature button in Premiere Pro CEP HTML');
+    assert.ok(standaloneBat.includes('id="btn-bidi-track"'), 'Expected #btn-bidi-track button in Premiere Pro CEP HTML');
+    assert.ok(standaloneBat.includes('id="chk-motion-blur"'), 'Expected #chk-motion-blur toggle in Premiere Pro CEP HTML');
+    assert.ok(standaloneBat.includes('id="slider-shutter-angle"'), 'Expected #slider-shutter-angle in Premiere Pro CEP HTML');
+    assert.ok(standaloneBat.includes('id="chk-auto-pause"'), 'Expected #chk-auto-pause in Premiere Pro CEP HTML');
+    assert.ok(standaloneBat.includes('id="slider-feature" min="8"'), 'Expected 8px micro-point minimum on #slider-feature');
   });
 });
+
 

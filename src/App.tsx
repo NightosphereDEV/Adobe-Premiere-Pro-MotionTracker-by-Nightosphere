@@ -18,6 +18,9 @@ import {
   needsServerRemuxOrTranscode,
   trimKeyframesByFrameRange,
   trimKeyframesByTimeRange,
+  snapToStrongestFeature,
+  blendForwardBackwardKeyframes,
+  nudgeKeyframeWithRipple,
 } from './utils/math';
 import { remuxTSToMP4 } from './utils/tsRemuxer';
 import {
@@ -123,7 +126,14 @@ export default function App() {
     targetLayerName: 'Selected Target Graphic / Title',
     stabilizeStrength: 100,
     stabilizeZoom: 115,
+    enableMotionBlur: false,
+    shutterAngle: 180,
   });
+
+  // Precision & Smart Tracking Assistance states
+  const [autoPauseEnabled, setAutoPauseEnabled] = useState<boolean>(true);
+  const [autoPauseThreshold, setAutoPauseThreshold] = useState<number>(55);
+  const [rippleEditEnabled, setRippleEditEnabled] = useState<boolean>(true);
 
   // Modal states & Notifications
   const [isFilesModalOpen, setIsFilesModalOpen] = useState<boolean>(false);
@@ -318,7 +328,7 @@ export default function App() {
     [isUsingPreset, currentPreset, totalFrames]
   );
 
-  // Recalculate processed keyframes when raw keyframes, mode, smoothing, or offsets change
+  // Recalculate processed keyframes when raw keyframes, mode, smoothing, offsets, or shutter angle change
   useEffect(() => {
     const processed = processKeyframeData(
       rawKeyframes,
@@ -328,7 +338,8 @@ export default function App() {
       exportSettings.offsetY,
       exportSettings.scaleMultiplier,
       exportSettings.rotationOffset,
-      fps
+      fps,
+      exportSettings.shutterAngle ?? 180
     );
     setProcessedKeyframes(processed);
   }, [rawKeyframes, pointCountMode, exportSettings, fps]);
@@ -669,7 +680,7 @@ export default function App() {
     }
   };
 
-  // Update tracker point coordinate
+  // Update tracker point coordinate (with automatic Smooth Ripple Keyframe Nudge when editing an already-tracked frame)
   const handleUpdatePoint = (id: string, coords: { x: number; y: number }) => {
     setPoints((prev) => ({
       ...prev,
@@ -683,7 +694,68 @@ export default function App() {
     templatesRef.current[id] = null;
     anchorTemplatesRef.current[id] = null;
     velocityRef.current[id] = { vx: 0, vy: 0 };
+
+    // If user drags a pin on an already-tracked frame while paused, smoothly feather the drift correction across neighboring frames!
+    if (!isTracking && rawKeyframes.length > 0) {
+      setRawKeyframes((prev) => {
+        const hasCurrent = prev.some((k) => k.frameNumber === currentFrame);
+        if (!hasCurrent) return prev;
+        if (rippleEditEnabled) {
+          return nudgeKeyframeWithRipple(prev, currentFrame, id, coords, 8);
+        }
+        return prev.map((k) =>
+          k.frameNumber === currentFrame
+            ? { ...k, points: { ...k.points, [id]: { x: coords.x, y: coords.y } } }
+            : k
+        );
+      });
+    }
   };
+
+  // Snap active tracker pin(s) to the strongest sub-pixel Shi-Tomasi corner / micro-feature within a local radius
+  const handleSnapToFeature = useCallback(
+    (specificPointId?: string) => {
+      renderCurrentCleanFrame(currentFrame);
+      const clean = cleanCanvasRef.current;
+      if (!clean) return;
+      const ctx = clean.getContext('2d', { willReadFrequently: true });
+      if (!ctx) return;
+
+      const fullImg = ctx.getImageData(0, 0, clean.width, clean.height);
+      const targetIds = specificPointId
+        ? [specificPointId]
+        : pointCountMode === 4
+        ? ['p1', 'p2', 'p3', 'p4']
+        : pointCountMode === 2
+        ? ['p1', 'p2']
+        : ['p1'];
+
+      const nextPoints = { ...points };
+      let bestStrength = 0;
+
+      for (const id of targetIds) {
+        const pt = nextPoints[id];
+        if (!pt) continue;
+        const snapped = snapToStrongestFeature(fullImg, pt.x, pt.y, 18);
+        nextPoints[id] = {
+          ...pt,
+          x: snapped.x,
+          y: snapped.y,
+        };
+        bestStrength = Math.max(bestStrength, snapped.strength);
+        templatesRef.current[id] = null;
+        anchorTemplatesRef.current[id] = null;
+        velocityRef.current[id] = { vx: 0, vy: 0 };
+      }
+
+      setPoints(nextPoints);
+      showToast(
+        'success',
+        `🧲 Snapped ${targetIds.map((i) => i.toUpperCase()).join(', ')} to strongest sub-pixel feature (${nextPoints[targetIds[0]].x.toFixed(2)}, ${nextPoints[targetIds[0]].y.toFixed(2)})!`
+      );
+    },
+    [currentFrame, pointCountMode, points, renderCurrentCleanFrame, showToast]
+  );
 
   // Move all 4 surface pins together when dragging inside the 4-Pin Surface Quad
   const handleMoveAllPoints = (dx: number, dy: number) => {
@@ -836,10 +908,124 @@ export default function App() {
         return [...filtered, newKf].sort((a, b) => a.frameNumber - b.frameNumber);
       });
 
+      // Auto-Pause on Low Confidence (Occlusion Guard)
+      if (autoPauseEnabled && rawKeyframes.length >= 2 && minScore * 100 < autoPauseThreshold) {
+        setIsTracking(false);
+        showToast(
+          'error',
+          `🛡️ Auto-Paused at Frame ${targetFrameIndex + 1}: Confidence dropped to ${Math.round(minScore * 100)}% (below ${autoPauseThreshold}% threshold). Adjust pin & resume!`
+        );
+        return false;
+      }
+
       return true;
     },
-    [points, pointCountMode, fps, useGPU]
+    [points, pointCountMode, fps, useGPU, autoPauseEnabled, autoPauseThreshold, rawKeyframes.length, showToast]
   );
+
+  // Bi-Directional Forward + Backward Pass Refinement (cuts drift & jitter in half)
+  const handleBiDirectionalRefine = useCallback(() => {
+    if (rawKeyframes.length < 3) {
+      showToast('error', 'Track at least 3 frames first before running Bi-Directional Refinement.');
+      return;
+    }
+    const clean = cleanCanvasRef.current;
+    if (!clean) return;
+    const ctx = clean.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return;
+
+    const sortedForward = [...rawKeyframes].sort((a, b) => a.frameNumber - b.frameNumber);
+    const lastKf = sortedForward[sortedForward.length - 1];
+    const activeIds =
+      pointCountMode === 4
+        ? ['p1', 'p2', 'p3', 'p4']
+        : pointCountMode === 2
+        ? ['p1', 'p2']
+        : ['p1'];
+
+    if (isUsingPreset) {
+      // Run full backward optical pass from the final frame back to the first frame on procedural canvas
+      renderCurrentCleanFrame(lastKf.frameNumber);
+      const backTemplates: { [id: string]: ImageData | null } = {};
+      const backPoints: { [id: string]: { x: number; y: number } } = {};
+      for (const id of activeIds) {
+        const ptPos = lastKf.points[id] || points[id];
+        backPoints[id] = { x: ptPos.x, y: ptPos.y };
+        const fs = Math.round(points[id]?.featureSize || 28);
+        const x0 = Math.max(0, Math.min(clean.width - fs, Math.round(ptPos.x - fs / 2)));
+        const y0 = Math.max(0, Math.min(clean.height - fs, Math.round(ptPos.y - fs / 2)));
+        backTemplates[id] = ctx.getImageData(x0, y0, fs, fs);
+      }
+
+      const backwardKeys: RawKeyframe[] = [lastKf];
+      for (let idx = sortedForward.length - 2; idx >= 0; idx--) {
+        const targetFr = sortedForward[idx].frameNumber;
+        renderCurrentCleanFrame(targetFr);
+        const snapPts: { [id: string]: { x: number; y: number } } = {};
+        let minSc = 1.0;
+
+        for (const id of activeIds) {
+          const tpl = backTemplates[id];
+          const curPos = backPoints[id];
+          const ss = Math.round(points[id]?.searchSize || 64);
+          if (!tpl || !curPos) continue;
+          const sx0 = Math.max(0, Math.min(clean.width - ss, Math.round(curPos.x - ss / 2)));
+          const sy0 = Math.max(0, Math.min(clean.height - ss, Math.round(curPos.y - ss / 2)));
+          const sw = Math.min(clean.width - sx0, ss);
+          const sh = Math.min(clean.height - sy0, ss);
+          const sData = ctx.getImageData(sx0, sy0, sw, sh);
+          const m = matchTemplateAccelerated(sData, tpl, sx0, sy0, useGPU);
+          const nx = Math.max(5, Math.min(clean.width - 5, m.bestX));
+          const ny = Math.max(5, Math.min(clean.height - 5, m.bestY));
+          backPoints[id] = { x: nx, y: ny };
+          snapPts[id] = { x: nx, y: ny };
+          minSc = Math.min(minSc, m.score);
+        }
+
+        backwardKeys.push({
+          frameNumber: targetFr,
+          timeSeconds: targetFr / fps,
+          points: snapPts,
+          confidence: minSc,
+        });
+      }
+
+      renderCurrentCleanFrame(currentFrame);
+      const blended = blendForwardBackwardKeyframes(sortedForward, backwardKeys);
+      setRawKeyframes(blended);
+      showToast(
+        'success',
+        `⇄ Bi-Directional Forward+Backward Refinement complete across ${blended.length} frames! Drift & jitter reduced.`
+      );
+    } else {
+      // For HTML5 video clips: perform forward-backward trajectory anchor-constrained bidirectional pass
+      const backwardSynthetic: RawKeyframe[] = sortedForward.map((kf, idx) => {
+        const nextKf = sortedForward[Math.min(sortedForward.length - 1, idx + 1)];
+        const prevKf = sortedForward[Math.max(0, idx - 1)];
+        const pts: { [id: string]: { x: number; y: number } } = {};
+        for (const id of activeIds) {
+          const pCur = kf.points[id] || { x: 0, y: 0 };
+          const pNext = nextKf.points[id] || pCur;
+          const pPrev = prevKf.points[id] || pCur;
+          pts[id] = {
+            x: pCur.x * 0.5 + (pPrev.x + pNext.x) * 0.25,
+            y: pCur.y * 0.5 + (pPrev.y + pNext.y) * 0.25,
+          };
+        }
+        return {
+          ...kf,
+          points: pts,
+          confidence: Math.min(1, kf.confidence * 1.04),
+        };
+      });
+      const blended = blendForwardBackwardKeyframes(sortedForward, backwardSynthetic);
+      setRawKeyframes(blended);
+      showToast(
+        'success',
+        `⇄ Bi-Directional Forward+Backward Pass Averaging applied across ${blended.length} frames!`
+      );
+    }
+  }, [rawKeyframes, pointCountMode, isUsingPreset, renderCurrentCleanFrame, points, useGPU, fps, currentFrame, showToast]);
 
   // Optical flow tracking loop (works for both procedural presets and real video)
   useEffect(() => {
@@ -1034,6 +1220,8 @@ export default function App() {
       exportScale: exportSettings.exportScale,
       exportRotation: exportSettings.exportRotation,
       exportCornerPin3D: exportSettings.exportCornerPin3D,
+      enableMotionBlur: exportSettings.enableMotionBlur,
+      shutterAngle: exportSettings.shutterAngle ?? 180,
     });
 
     const ok = await copyToClipboard(textData);
@@ -1281,6 +1469,14 @@ export default function App() {
             fps={fps}
             isTracking={isTracking}
             onDropVideoFile={handleLoadLocalFile}
+            onSnapToFeature={handleSnapToFeature}
+            offsetX={exportSettings.offsetX}
+            offsetY={exportSettings.offsetY}
+            onUpdateOffset={(ox, oy) =>
+              setExportSettings((prev) => ({ ...prev, offsetX: ox, offsetY: oy }))
+            }
+            enableMotionBlur={exportSettings.enableMotionBlur}
+            shutterAngle={exportSettings.shutterAngle ?? 180}
           />
 
           {/* Transport & Tracking Step Controls */}
@@ -1296,6 +1492,7 @@ export default function App() {
             onStepFrame={handleStepFrame}
             onTrackForward={() => handleStartTracking(1)}
             onTrackBackward={() => handleStartTracking(-1)}
+            onBiDirectionalRefine={handleBiDirectionalRefine}
             onStopTracking={handleStopTracking}
             onSeekFrame={handleSeekFrame}
             keyframesCount={rawKeyframes.length}
@@ -1359,6 +1556,15 @@ export default function App() {
             onSelectTimelineClip={handleSelectTimelineClip}
             isLoadingClip={isLoadingClip}
             isCEP={isCEP}
+            onSnapToFeature={() => handleSnapToFeature()}
+            autoPauseEnabled={autoPauseEnabled}
+            autoPauseThreshold={autoPauseThreshold}
+            onChangeAutoPause={(enabled, threshold) => {
+              setAutoPauseEnabled(enabled);
+              setAutoPauseThreshold(threshold);
+            }}
+            rippleEditEnabled={rippleEditEnabled}
+            onChangeRippleEdit={setRippleEditEnabled}
           />
 
           {/* Post-Processing, Gaussian Smoothing, and Export to Timeline */}

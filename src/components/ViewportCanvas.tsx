@@ -1,7 +1,7 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { TrackerPoint, RawKeyframe, ProcessedKeyframe, PointCountMode } from '../types/tracker';
 import { secondsToTimecode, isSupportedVideoFile, compute3DSurfacePose } from '../utils/math';
-import { ZoomIn, ZoomOut, Maximize2, Crosshair, UploadCloud, Search, Hand, Target, Box } from 'lucide-react';
+import { ZoomIn, ZoomOut, Maximize2, Crosshair, UploadCloud, Search, Hand, Target, Box, Magnet, MoveUpRight } from 'lucide-react';
 
 interface ViewportCanvasProps {
   videoRef: React.RefObject<HTMLVideoElement | null>;
@@ -11,6 +11,12 @@ interface ViewportCanvasProps {
   pointCountMode: PointCountMode;
   onUpdatePoint: (id: string, newCoords: { x: number; y: number }) => void;
   onMoveAllPoints?: (dx: number, dy: number) => void;
+  onSnapToFeature?: (pointId?: string) => void;
+  offsetX?: number;
+  offsetY?: number;
+  onUpdateOffset?: (offsetX: number, offsetY: number) => void;
+  enableMotionBlur?: boolean;
+  shutterAngle?: number;
   rawKeyframes: RawKeyframe[];
   processedKeyframes: ProcessedKeyframe[];
   currentFrame: number;
@@ -50,6 +56,12 @@ export const ViewportCanvas: React.FC<ViewportCanvasProps> = ({
   pointCountMode,
   onUpdatePoint,
   onMoveAllPoints,
+  onSnapToFeature,
+  offsetX = 0,
+  offsetY = 0,
+  onUpdateOffset,
+  enableMotionBlur = false,
+  shutterAngle = 180,
   rawKeyframes,
   processedKeyframes,
   currentFrame,
@@ -64,6 +76,8 @@ export const ViewportCanvas: React.FC<ViewportCanvasProps> = ({
 
   const [draggingPointId, setDraggingPointId] = useState<string | null>(null);
   const [isDraggingSurface, setIsDraggingSurface] = useState<boolean>(false);
+  const [isDraggingOffset, setIsDraggingOffset] = useState<boolean>(false);
+  const [showOffsetAnchor, setShowOffsetAnchor] = useState<boolean>(false);
   const surfaceDragPrevRef = useRef<{ x: number; y: number }>({ x: 0, y: 0 });
 
   const [zoomLevel, setZoomLevel] = useState<number>(1);
@@ -83,6 +97,7 @@ export const ViewportCanvas: React.FC<ViewportCanvasProps> = ({
 
   const isSurfaceMode = pointCountMode === 4;
   const isTwoPoint = pointCountMode === 2;
+  const isOffsetVisible = showOffsetAnchor || offsetX !== 0 || offsetY !== 0;
 
   // Redraw canvas with video frame and overlay graphics
   const renderOverlay = useCallback(() => {
@@ -384,6 +399,92 @@ export const ViewportCanvas: React.FC<ViewportCanvasProps> = ({
       ctx.restore();
     }
 
+    // 3b. Render Live Motion Blur Shutter Ghost Trail on Viewport when enabled
+    if (enableMotionBlur && processedKeyframes.length > 1) {
+      const curPkf = processedKeyframes.find((k) => k.frameNumber === currentFrame);
+      if (curPkf && curPkf.motionBlurLength && curPkf.motionBlurLength > 0.4) {
+        const vx = curPkf.velocityX || 0;
+        const vy = curPkf.velocityY || 0;
+        const shutterRatio = Math.max(0, Math.min(360, shutterAngle)) / 360;
+        const blurDx = vx * shutterRatio;
+        const blurDy = vy * shutterRatio;
+
+        ctx.save();
+        for (let g = 4; g >= 1; g--) {
+          const frac = (g / 4) * 0.85;
+          const gx = curPkf.x - blurDx * frac;
+          const gy = curPkf.y - blurDy * frac;
+          const alpha = (1 - g / 5) * 0.45;
+          ctx.strokeStyle = `rgba(245, 158, 11, ${alpha})`;
+          ctx.fillStyle = `rgba(245, 158, 11, ${alpha * 0.5})`;
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.arc(gx, gy, 6 + g * 1.2, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.stroke();
+        }
+        // Velocity vector arrow
+        ctx.strokeStyle = 'rgba(251, 191, 36, 0.9)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(curPkf.x - blurDx * 0.5, curPkf.y - blurDy * 0.5);
+        ctx.lineTo(curPkf.x + blurDx * 0.5, curPkf.y + blurDy * 0.5);
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+
+    // 3c. Render Interactive Target Offset Anchor ("Track Here, Pin Text Over There")
+    const basePt = isSurfaceMode && points['p1'] && points['p2'] && points['p3'] && points['p4']
+      ? {
+          x: (points['p1'].x + points['p2'].x + points['p3'].x + points['p4'].x) * 0.25,
+          y: (points['p1'].y + points['p2'].y + points['p3'].y + points['p4'].y) * 0.25,
+        }
+      : points['p1'];
+    const isOffsetVisible = showOffsetAnchor || Math.abs(offsetX) > 0.5 || Math.abs(offsetY) > 0.5;
+    if (basePt && isOffsetVisible) {
+      const targetAnchorX = basePt.x + offsetX;
+      const targetAnchorY = basePt.y + offsetY;
+
+      ctx.save();
+      // Dashed vector leader from tracked feature to offset pin target
+      ctx.strokeStyle = 'rgba(16, 185, 129, 0.85)';
+      ctx.lineWidth = 1.5;
+      ctx.setLineDash([4, 3]);
+      ctx.beginPath();
+      ctx.moveTo(basePt.x, basePt.y);
+      ctx.lineTo(targetAnchorX, targetAnchorY);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Target Offset Reticle
+      ctx.fillStyle = 'rgba(16, 185, 129, 0.22)';
+      ctx.strokeStyle = '#10b981';
+      ctx.lineWidth = 1.8;
+      ctx.beginPath();
+      ctx.arc(targetAnchorX, targetAnchorY, 9, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.moveTo(targetAnchorX - 13, targetAnchorY);
+      ctx.lineTo(targetAnchorX + 13, targetAnchorY);
+      ctx.moveTo(targetAnchorX, targetAnchorY - 13);
+      ctx.lineTo(targetAnchorX, targetAnchorY + 13);
+      ctx.stroke();
+
+      // Label badge
+      ctx.fillStyle = 'rgba(6, 78, 59, 0.92)';
+      ctx.fillRect(targetAnchorX + 10, targetAnchorY - 16, 92, 15);
+      ctx.strokeStyle = '#10b981';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(targetAnchorX + 10, targetAnchorY - 16, 92, 15);
+      ctx.fillStyle = '#a7f3d0';
+      ctx.font = 'bold 9px monospace';
+      ctx.fillText(`PIN (${offsetX >= 0 ? '+' : ''}${Math.round(offsetX)},${offsetY >= 0 ? '+' : ''}${Math.round(offsetY)})`, targetAnchorX + 14, targetAnchorY - 5);
+      ctx.restore();
+    }
+
     // 4. Render 6x Precision Magnifier Loupe
     if (showLoupe && loupeCanvasRef.current && cleanCanvas) {
       const lCanvas = loupeCanvasRef.current;
@@ -459,6 +560,11 @@ export const ViewportCanvas: React.FC<ViewportCanvasProps> = ({
     showLoupe,
     draggingPointId,
     hoverCoords,
+    enableMotionBlur,
+    shutterAngle,
+    showOffsetAnchor,
+    offsetX,
+    offsetY,
   ]);
 
   // Continuously request animation frame
@@ -534,6 +640,23 @@ export const ViewportCanvas: React.FC<ViewportCanvasProps> = ({
     if (isTracking) return;
     const { x, y } = getCanvasCoords(e);
 
+    // Check hit test against Target Offset Anchor first when visible
+    const basePt = isSurfaceMode && points['p1'] && points['p2'] && points['p3'] && points['p4']
+      ? {
+          x: (points['p1'].x + points['p2'].x + points['p3'].x + points['p4'].x) * 0.25,
+          y: (points['p1'].y + points['p2'].y + points['p3'].y + points['p4'].y) * 0.25,
+        }
+      : points['p1'];
+    const isOffsetVisible = showOffsetAnchor || Math.abs(offsetX) > 0.5 || Math.abs(offsetY) > 0.5;
+    if (basePt && isOffsetVisible && onUpdateOffset) {
+      const anchorX = basePt.x + offsetX;
+      const anchorY = basePt.y + offsetY;
+      if (Math.hypot(x - anchorX, y - anchorY) <= Math.max(12, 16 / Math.sqrt(zoomLevel))) {
+        setIsDraggingOffset(true);
+        return;
+      }
+    }
+
     // Check hit test against active pins (p1..p4 in surface mode, p1..p2 in 2-point, p1 in 1-point)
     const targetPoints = isSurfaceMode
       ? ['p1', 'p2', 'p3', 'p4']
@@ -575,7 +698,11 @@ export const ViewportCanvas: React.FC<ViewportCanvasProps> = ({
       const snapX = zoomLevel >= 2 ? Math.round(x * 2) / 2 : Math.round(x);
       const snapY = zoomLevel >= 2 ? Math.round(y * 2) / 2 : Math.round(y);
       onUpdatePoint(closestId, { x: snapX, y: snapY });
-      setDraggingPointId(closestId);
+      if (e.shiftKey && onSnapToFeature) {
+        setTimeout(() => onSnapToFeature(closestId), 10);
+      } else {
+        setDraggingPointId(closestId);
+      }
       return;
     }
 
@@ -583,7 +710,11 @@ export const ViewportCanvas: React.FC<ViewportCanvasProps> = ({
     const snap = zoomLevel >= 2 ? Math.round(x * 2) / 2 : Math.round(x);
     const snapY = zoomLevel >= 2 ? Math.round(y * 2) / 2 : Math.round(y);
     onUpdatePoint('p1', { x: snap, y: snapY });
-    setDraggingPointId('p1');
+    if (e.shiftKey && onSnapToFeature) {
+      setTimeout(() => onSnapToFeature('p1'), 10);
+    } else {
+      setDraggingPointId('p1');
+    }
   };
 
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -605,6 +736,19 @@ export const ViewportCanvas: React.FC<ViewportCanvasProps> = ({
     const clampedY = Math.max(4, Math.min(canvas.height - 4, zoomLevel >= 2 ? Math.round(y * 2) / 2 : Math.round(y)));
     setHoverCoords({ x: clampedX, y: clampedY });
 
+    if (isDraggingOffset && onUpdateOffset) {
+      const basePt = isSurfaceMode && points['p1'] && points['p2'] && points['p3'] && points['p4']
+        ? {
+            x: (points['p1'].x + points['p2'].x + points['p3'].x + points['p4'].x) * 0.25,
+            y: (points['p1'].y + points['p2'].y + points['p3'].y + points['p4'].y) * 0.25,
+          }
+        : points['p1'];
+      if (basePt) {
+        onUpdateOffset(Math.round(clampedX - basePt.x), Math.round(clampedY - basePt.y));
+      }
+      return;
+    }
+
     if (isDraggingSurface && onMoveAllPoints && !isTracking) {
       const dx = clampedX - surfaceDragPrevRef.current.x;
       const dy = clampedY - surfaceDragPrevRef.current.y;
@@ -622,12 +766,14 @@ export const ViewportCanvas: React.FC<ViewportCanvasProps> = ({
   const handleMouseUp = () => {
     setDraggingPointId(null);
     setIsDraggingSurface(false);
+    setIsDraggingOffset(false);
     setIsPanning(false);
   };
 
   const handleMouseLeave = () => {
     setDraggingPointId(null);
     setIsDraggingSurface(false);
+    setIsDraggingOffset(false);
     setIsPanning(false);
     setHoverCoords(null);
   };
@@ -705,13 +851,49 @@ export const ViewportCanvas: React.FC<ViewportCanvasProps> = ({
           )}
         </div>
 
-        {/* Precision Zoom, Pan & Loupe Controls */}
-        <div className="flex items-center gap-1.5">
+        {/* Precision Zoom, Pan, Snap & Loupe Controls */}
+        <div className="flex items-center gap-1.5 flex-wrap">
           {isTracking && (
             <span className="flex items-center gap-1 text-[11px] font-mono text-emerald-400 animate-pulse bg-emerald-950/60 px-2 py-0.5 rounded border border-emerald-500/30">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
               TRACKING
             </span>
+          )}
+
+          {/* 1-Click Sub-Pixel Corner Snap Button */}
+          {onSnapToFeature && (
+            <button
+              onClick={() => onSnapToFeature()}
+              className="flex items-center gap-1 px-2 py-1 bg-indigo-950/80 hover:bg-indigo-900/80 text-indigo-200 rounded border border-indigo-500/40 text-[11px] font-medium transition-colors"
+              title="Snap active tracker pin(s) to the sharpest high-contrast corner/pixel within 18px (or Shift+Click on canvas)"
+            >
+              <Magnet className="w-3 h-3 text-indigo-400" />
+              <span>Snap Corner</span>
+            </button>
+          )}
+
+          {/* Interactive Target Offset Anchor Toggle */}
+          {onUpdateOffset && (
+            <button
+              onClick={() => {
+                setShowOffsetAnchor((v) => {
+                  const next = !v;
+                  if (next && offsetX === 0 && offsetY === 0) {
+                    onUpdateOffset(60, -40);
+                  }
+                  return next;
+                });
+              }}
+              className={`flex items-center gap-1 px-2 py-1 rounded border text-[11px] font-medium transition-colors ${
+                showOffsetAnchor || Math.abs(offsetX) > 0.5 || Math.abs(offsetY) > 0.5
+                  ? 'bg-emerald-950/80 border-emerald-500/50 text-emerald-300'
+                  : 'bg-[#282828] border-[#383838] text-gray-300 hover:text-white'
+              }`}
+              title="Toggle draggable Target Offset Pin on canvas ('Track Here, Pin Text Over There')"
+            >
+              <MoveUpRight className="w-3 h-3" />
+              <span>Offset Pin</span>
+            </button>
           )}
 
           {/* Quick Zoom to P1 Target Button */}
@@ -809,7 +991,7 @@ export const ViewportCanvas: React.FC<ViewportCanvasProps> = ({
               ? 'grabbing'
               : isPanMode
               ? 'grab'
-              : draggingPointId
+              : draggingPointId || isDraggingOffset
               ? 'none'
               : 'crosshair',
           }}
@@ -857,7 +1039,7 @@ export const ViewportCanvas: React.FC<ViewportCanvasProps> = ({
             FRAME {currentFrame + 1} / {totalFrames || 1}
           </span>
           <span className="text-[10px] text-gray-500 hidden sm:inline">
-            Scroll wheel to zoom (100%–800%) • Click &quot;Zoom to P1&quot; to pinpoint small objects
+            Shift+Click to auto-snap to strongest corner • Drag &quot;Offset Pin&quot; to offset text placement
           </span>
         </div>
         <div className="flex items-center gap-3">

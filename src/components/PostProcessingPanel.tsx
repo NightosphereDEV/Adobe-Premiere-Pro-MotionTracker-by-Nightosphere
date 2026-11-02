@@ -331,6 +331,76 @@ export const PostProcessingPanel: React.FC<PostProcessingPanelProps> = ({
         </div>
       </div>
 
+      {/* Motion Blur for Tracked Text & Objects (Transform Shutter Angle + Velocity Directional Blur) */}
+      <div className="bg-[#23192d] border border-fuchsia-500/40 p-2.5 rounded-md flex flex-col gap-2">
+        <div className="flex items-center justify-between">
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={settings.enableMotionBlur === true}
+              onChange={(e) =>
+                onUpdateSettings({
+                  enableMotionBlur: e.target.checked,
+                  applyToTransformEffect: e.target.checked ? true : settings.applyToTransformEffect,
+                  shutterAngle: settings.shutterAngle ?? 180,
+                })
+              }
+              aria-label="Enable Motion Blur (Shutter Angle)"
+              className="w-4 h-4 rounded accent-fuchsia-400 cursor-pointer"
+            />
+            <span className="text-xs font-semibold text-fuchsia-200">
+              💨 Motion Blur (Tracked Text & Layers)
+            </span>
+          </label>
+          <span className="font-mono text-[11px] text-fuchsia-300 bg-[#150f1d] px-1.5 py-0.5 rounded border border-fuchsia-700/50">
+            {settings.enableMotionBlur ? `${settings.shutterAngle ?? 180}° Shutter` : 'OFF'}
+          </span>
+        </div>
+
+        <p className="text-[11px] text-gray-300 leading-snug">
+          Applies native <strong>Transform → Shutter Angle</strong> motion blur in Premiere Pro and calculates frame-to-frame velocity directional blur so fast-moving tracked text blurs naturally with the shot.
+        </p>
+
+        {settings.enableMotionBlur && (
+          <div className="flex flex-col gap-1.5 pt-1 border-t border-fuchsia-800/40">
+            <div className="flex items-center justify-between text-[11px]">
+              <span className="text-gray-300">Shutter Angle (0°–360°):</span>
+              <div className="flex items-center gap-1">
+                {[90, 180, 270, 360].map((deg) => (
+                  <button
+                    key={deg}
+                    type="button"
+                    onClick={() => onUpdateSettings({ shutterAngle: deg })}
+                    className={`px-1.5 py-0.5 rounded text-[10px] font-mono border transition-colors ${
+                      (settings.shutterAngle ?? 180) === deg
+                        ? 'bg-fuchsia-600 text-white border-fuchsia-400'
+                        : 'bg-[#181220] text-fuchsia-200 border-fuchsia-800/60 hover:bg-[#241b30]'
+                    }`}
+                  >
+                    {deg}°
+                  </button>
+                ))}
+              </div>
+            </div>
+            <input
+              type="range"
+              min={0}
+              max={360}
+              step={15}
+              aria-label="Motion Blur Shutter Angle"
+              value={settings.shutterAngle ?? 180}
+              onChange={(e) => onUpdateSettings({ shutterAngle: parseInt(e.target.value, 10) })}
+              className="w-full h-1.5 bg-[#362747] rounded appearance-none cursor-pointer accent-fuchsia-400"
+            />
+            <div className="flex justify-between text-[10px] text-gray-400">
+              <span>0° (No Blur)</span>
+              <span>180° (Cinema Standard)</span>
+              <span>360° (Max Trail)</span>
+            </div>
+          </div>
+        )}
+      </div>
+
       {/* Use Transform Effect Toggle */}
       <div className="bg-[#18212e] border border-[#234166] p-2.5 rounded-md flex flex-col gap-1.5">
         <label className="flex items-center justify-between cursor-pointer">

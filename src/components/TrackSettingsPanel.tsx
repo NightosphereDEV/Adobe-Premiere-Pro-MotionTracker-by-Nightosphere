@@ -18,6 +18,12 @@ interface TrackSettingsPanelProps {
   onChangeFeatureSize: (val: number) => void;
   searchSize: number;
   onChangeSearchSize: (val: number) => void;
+  onSnapToFeature?: () => void;
+  autoPauseEnabled?: boolean;
+  autoPauseThreshold?: number;
+  onChangeAutoPause?: (enabled: boolean, threshold?: number) => void;
+  rippleEditEnabled?: boolean;
+  onChangeRippleEdit?: (enabled: boolean) => void;
   onResetPoints: () => void;
   onSelectPreset: (preset: DemoPreset) => void;
   selectedPresetId: string;
@@ -40,6 +46,12 @@ export const TrackSettingsPanel: React.FC<TrackSettingsPanelProps> = ({
   onChangeFeatureSize,
   searchSize,
   onChangeSearchSize,
+  onSnapToFeature,
+  autoPauseEnabled = true,
+  autoPauseThreshold = 55,
+  onChangeAutoPause,
+  rippleEditEnabled = true,
+  onChangeRippleEdit,
   onResetPoints,
   onSelectPreset,
   selectedPresetId,
@@ -362,8 +374,89 @@ export const TrackSettingsPanel: React.FC<TrackSettingsPanelProps> = ({
         )}
       </div>
 
-      {/* Box Size Sliders */}
+      {/* Precision Small-Point & Dual-Ring Search Controls */}
       <div className="flex flex-col gap-2 pt-2 border-t border-[#2a2a2a]">
+        <div className="flex items-center justify-between">
+          <span className="text-[11px] font-semibold text-gray-200">
+            Precision Point & Dual-Ring Search
+          </span>
+          {onSnapToFeature && (
+            <button
+              type="button"
+              onClick={onSnapToFeature}
+              className="flex items-center gap-1 px-2 py-0.5 bg-[#1a2c3e] hover:bg-[#233d56] text-cyan-300 border border-cyan-500/40 rounded text-[10px] font-medium transition-colors"
+              title="Scans a 16px radius around active tracking pin(s) using a Shi-Tomasi corner detector and snaps to the sharpest high-contrast pixel (or Shift+Click on canvas)"
+            >
+              <span>🧲</span>
+              <span>Snap to Strongest Corner</span>
+            </button>
+          )}
+        </div>
+
+        {/* 1-Click Dual-Ring Presets for Tiny Screen Dots vs Fast Motion */}
+        <div className="grid grid-cols-4 gap-1">
+          <button
+            type="button"
+            onClick={() => {
+              onChangeFeatureSize(8);
+              onChangeSearchSize(44);
+            }}
+            className={`py-1 px-1 rounded text-[10px] font-medium border transition-colors ${
+              featureSize <= 10
+                ? 'bg-cyan-950/80 border-cyan-400 text-cyan-200'
+                : 'bg-[#252525] border-[#333333] text-gray-300 hover:bg-[#2d2d2d]'
+            }`}
+            title="8px Inner Ring / 44px Outer Search: Ideal for tracking a singular tiny pixel, LED, or small icon on a screen"
+          >
+            8px Micro Dot
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              onChangeFeatureSize(16);
+              onChangeSearchSize(56);
+            }}
+            className={`py-1 px-1 rounded text-[10px] font-medium border transition-colors ${
+              featureSize > 10 && featureSize <= 20
+                ? 'bg-cyan-950/80 border-cyan-400 text-cyan-200'
+                : 'bg-[#252525] border-[#333333] text-gray-300 hover:bg-[#2d2d2d]'
+            }`}
+            title="16px Inner Ring / 56px Outer Search: Ideal for sharp screen corners, UI buttons, and small markers"
+          >
+            16px Corner
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              onChangeFeatureSize(28);
+              onChangeSearchSize(64);
+            }}
+            className={`py-1 px-1 rounded text-[10px] font-medium border transition-colors ${
+              featureSize > 20 && searchSize <= 80
+                ? 'bg-cyan-950/80 border-cyan-400 text-cyan-200'
+                : 'bg-[#252525] border-[#333333] text-gray-300 hover:bg-[#2d2d2d]'
+            }`}
+            title="28px Inner Ring / 64px Outer Search: Balanced for general objects, faces, and vehicles"
+          >
+            28px Standard
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              onChangeFeatureSize(32);
+              onChangeSearchSize(112);
+            }}
+            className={`py-1 px-1 rounded text-[10px] font-medium border transition-colors ${
+              searchSize > 80
+                ? 'bg-cyan-950/80 border-cyan-400 text-cyan-200'
+                : 'bg-[#252525] border-[#333333] text-gray-300 hover:bg-[#2d2d2d]'
+            }`}
+            title="32px Inner Ring / 112px Wide Search: Ideal for fast camera whip-pans and sports balls"
+          >
+            112px Fast
+          </button>
+        </div>
+
         <div className="flex items-center justify-between text-xs">
           <div className="flex items-center gap-1.5 text-gray-300">
             <Sliders className="w-3.5 h-3.5 text-[#3ea6ff]" />
@@ -375,15 +468,16 @@ export const TrackSettingsPanel: React.FC<TrackSettingsPanelProps> = ({
         </div>
         <input
           type="range"
-          min={14}
+          min={8}
           max={64}
           step={2}
+          aria-label="Feature Box Inner Target Size"
           value={featureSize}
           onChange={(e) => onChangeFeatureSize(parseInt(e.target.value, 10))}
           className="w-full h-1.5 bg-[#333333] rounded-lg appearance-none cursor-pointer accent-[#3ea6ff]"
         />
 
-        <div className="flex items-center justify-between text-xs mt-1">
+        <div className="flex items-center justify-between text-xs mt-0.5">
           <div className="flex items-center gap-1.5 text-gray-300">
             <Sliders className="w-3.5 h-3.5 text-emerald-400" />
             <span>Search Window (Outer Region):</span>
@@ -397,10 +491,65 @@ export const TrackSettingsPanel: React.FC<TrackSettingsPanelProps> = ({
           min={28}
           max={140}
           step={4}
+          aria-label="Search Window Outer Region Size"
           value={searchSize}
           onChange={(e) => onChangeSearchSize(parseInt(e.target.value, 10))}
           className="w-full h-1.5 bg-[#333333] rounded-lg appearance-none cursor-pointer accent-emerald-400"
         />
+
+        {/* Smart Tracking Assistants: Ripple Nudge & Auto-Pause on Low Confidence */}
+        <div className="bg-[#17171b] border border-[#2b2b36] rounded p-2 flex flex-col gap-1.5 mt-1">
+          {onChangeRippleEdit && (
+            <label
+              className="flex items-center justify-between text-[11px] text-gray-200 cursor-pointer"
+              title="When you manually drag a pin on an already-tracked frame to fix drift, automatically smooths neighboring +-8 frames so there is no jump"
+            >
+              <span>✨ 1-Drag Ripple Drift Fix (±8 frames)</span>
+              <input
+                type="checkbox"
+                checked={rippleEditEnabled}
+                onChange={(e) => onChangeRippleEdit(e.target.checked)}
+                className="rounded accent-[#3ea6ff]"
+              />
+            </label>
+          )}
+
+          {onChangeAutoPause && (
+            <div className="flex flex-col gap-1 pt-1 border-t border-[#25252e]">
+              <div className="flex items-center justify-between text-[11px]">
+                <label
+                  className="flex items-center gap-1.5 text-gray-200 cursor-pointer"
+                  title="Automatically pauses tracking if object gets blocked/occluded and match confidence drops below threshold"
+                >
+                  <input
+                    type="checkbox"
+                    checked={autoPauseEnabled}
+                    onChange={(e) => onChangeAutoPause(e.target.checked, autoPauseThreshold)}
+                    className="rounded accent-amber-400"
+                  />
+                  <span>🛑 Auto-Pause on Occlusion / Low Conf</span>
+                </label>
+                <span className="font-mono text-[10px] text-amber-300">
+                  &lt; {autoPauseThreshold}%
+                </span>
+              </div>
+              {autoPauseEnabled && (
+                <input
+                  type="range"
+                  min={35}
+                  max={85}
+                  step={5}
+                  aria-label="Auto-Pause Confidence Threshold"
+                  value={autoPauseThreshold}
+                  onChange={(e) =>
+                    onChangeAutoPause(true, parseInt(e.target.value, 10))
+                  }
+                  className="w-full h-1 bg-[#2c2c35] rounded appearance-none cursor-pointer accent-amber-400"
+                />
+              )}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );

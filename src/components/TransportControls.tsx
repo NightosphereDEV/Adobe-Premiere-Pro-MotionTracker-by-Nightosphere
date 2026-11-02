@@ -34,6 +34,7 @@ interface TransportControlsProps {
   onDeleteBeforePlayhead: () => void;
   onTrimByTimeRange: (startSec: number, endSec: number, mode: 'keep-only-range' | 'delete-range') => void;
   onClearAllKeyframes: () => void;
+  onBiDirectionalRefine?: () => void;
 }
 
 export const TransportControls: React.FC<TransportControlsProps> = ({
@@ -56,6 +57,7 @@ export const TransportControls: React.FC<TransportControlsProps> = ({
   onDeleteBeforePlayhead,
   onTrimByTimeRange,
   onClearAllKeyframes,
+  onBiDirectionalRefine,
 }) => {
   const [rangeStartSec, setRangeStartSec] = useState<string>('0');
   const [rangeEndSec, setRangeEndSec] = useState<string>('5');
@@ -195,6 +197,20 @@ export const TransportControls: React.FC<TransportControlsProps> = ({
             >
               <FastForward className="w-3.5 h-3.5" />
               <span>Track Fwd ►</span>
+            </button>
+          )}
+
+          {/* Bi-Directional Forward + Backward Averaging Refine */}
+          {onBiDirectionalRefine && (
+            <button
+              type="button"
+              onClick={onBiDirectionalRefine}
+              disabled={isTracking || keyframesCount < 2}
+              className="flex items-center gap-1 px-2.5 py-1.5 bg-[#261e3a] hover:bg-[#342850] text-purple-200 rounded text-xs font-medium border border-purple-500/40 disabled:opacity-40 transition-colors"
+              title="Bi-Directional Forward + Backward Pass Averaging: Runs reverse verification and blends forward & backward paths by confidence to cut drift and jitter in half"
+            >
+              <span>⇄</span>
+              <span>Bi-Dir Refine</span>
             </button>
           )}
         </div>
